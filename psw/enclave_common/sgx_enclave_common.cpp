@@ -65,6 +65,7 @@ static se_file_handle_t s_hdevice = -1;         //used for driver_type of SGX_DR
 static std::map<void*, int> s_hfile;            //enclave file handles for driver_type of SGX_DRIVER_IN_KERNEL
 
 static std::map<void*, size_t> s_enclave_size;
+static std::map<void*, bool> s_enclave_0_base;
 static std::map<void*, bool> s_enclave_init;
 static std::map<void*, sgx_attributes_t> s_secs_attr;
 
@@ -534,6 +535,7 @@ extern "C" void* COMM_API enclave_create(
         s_hfile[enclave_base] = hdevice_temp;
     }
     s_enclave_size[enclave_base] = virtual_size;
+    s_enclave_0_base[enclave_base] = false;
 
     sgx_attributes_t secs_attr;
     memset(&secs_attr, 0, sizeof(sgx_attributes_t));
@@ -548,6 +550,211 @@ extern "C" void* COMM_API enclave_create(
 
     if (enclave_error != NULL)
         *enclave_error = ENCLAVE_ERROR_SUCCESS;
+    return enclave_base;
+}
+
+/* enclave_create()
+ * Parameters:
+ *      base_address [in, optional] - An optional preferred base address for the enclave.
+ *      virtual_size [in] - The virtual address range of the enclave in bytes.
+ *      initial_commit[in] - The amount of physical memory to reserve for the initial load of the enclave in bytes.
+ *      type [in] - The architecture type of the enclave that you want to create.
+ *      info [in] - A pointer to the architecture-specific information to use to create the enclave.
+ *      info_size [in] - The length of the structure that the info parameter points to, in bytes.
+ *      enclave_error [out, optional] - An optional pointer to a variable that receives an enclave error code.
+ * Return Value:
+ *      If the function succeeds, the return value is the base address of the created enclave.
+ *      If the function fails, the return value is NULL. The extended error information will be in the enclave_error parameter if used.
+*/
+extern "C" void* COMM_API enclave_create_0_base(
+    COMM_IN_OPT void* base_address,
+    COMM_IN size_t virtual_size,
+    COMM_IN size_t initial_commit,
+    COMM_IN uint32_t type,
+    COMM_IN const void* info,
+    COMM_IN size_t info_size,
+    COMM_OUT_OPT uint32_t* enclave_error)
+{
+    UNUSED(initial_commit);
+    int hdevice_temp = -1;
+    size_t enclave_size = virtual_size;
+    void* enclave_base = NULL;
+
+    if ((type != ENCLAVE_TYPE_SGX1 && type != ENCLAVE_TYPE_SGX2) || info == NULL) {
+        if (enclave_error != NULL)
+            *enclave_error = ENCLAVE_INVALID_PARAMETER;
+        return NULL;
+    }
+
+    const enclave_create_sgx_t* enclave_create_sgx = (const enclave_create_sgx_t*)info;
+    if (info_size == 0 || sizeof(*enclave_create_sgx) != info_size) {
+        if (enclave_error != NULL)
+            *enclave_error = ENCLAVE_INVALID_PARAMETER;
+        return NULL;
+    }
+
+    secs_t* secs = (secs_t*)enclave_create_sgx->secs;
+    SE_TRACE(SE_TRACE_DEBUG, "\n secs->attibutes.flags = %llx, secs->attributes.xfrm = %llx \n", secs->attributes.flags, secs->attributes.xfrm);
+
+    if (s_driver_type == SGX_DRIVER_UNKNOWN)
+    {
+        //the driver type is not know and the device is not open
+        //determine the driver type and open the device
+        if (false == get_driver_type(&s_driver_type))
+        {
+            SE_TRACE(SE_TRACE_WARNING, "\ncreate enclave: failed to find a driver\n");
+            if (enclave_error != NULL)
+                *enclave_error = ENCLAVE_NOT_SUPPORTED;
+            return NULL;
+        }
+        //if out-of-tree or dcap driver then open the device - we just do this once
+        if (( s_driver_type == SGX_DRIVER_OUT_OF_TREE) || (s_driver_type == SGX_DRIVER_DCAP))
+        {
+            open_device();
+        } 
+    }
+    //if in-kernel driver then open the file for each enclave load
+    if (s_driver_type == SGX_DRIVER_IN_KERNEL)
+    {
+        if (false == open_file( &hdevice_temp)) {
+            if (enclave_error != NULL)
+                *enclave_error = ENCLAVE_NOT_SUPPORTED;
+            return NULL;
+        }
+    }
+    else
+    {
+        hdevice_temp = s_hdevice;
+    }
+    
+    if(s_driver_type == SGX_DRIVER_IN_KERNEL)
+    {
+        enclave_base = mmap(base_address, enclave_size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    else 
+    {
+        enclave_base = mmap(base_address, enclave_size, PROT_NONE, MAP_FIXED | MAP_SHARED, hdevice_temp, 0);
+    }
+    if (enclave_base == MAP_FAILED) {
+        SE_TRACE(SE_TRACE_WARNING, "\ncreate enclave 0-base: mmap failed, errno = %d\n", errno);
+        if (enclave_error != NULL)
+            *enclave_error = error_driver2api(-1, errno);
+        if(s_driver_type == SGX_DRIVER_IN_KERNEL)
+        {
+            close_file(&hdevice_temp);
+        }
+        return NULL;
+    }
+
+    if (enclave_base != base_address) {
+        SE_TRACE(SE_TRACE_WARNING, "\ncreate enclave 0-base: failed to reserve the required addr, request=%d, returned=%d\n",base_address, enclave_base ); 
+        int ret = munmap(enclave_base, enclave_size);
+        if(ret == -1)
+        {
+            SE_TRACE(SE_TRACE_WARNING, "\ncreate enclave 0-base: munmap failed, errno = %d\n", errno);
+        }
+        if(s_driver_type == SGX_DRIVER_IN_KERNEL)
+        {
+            close_file(&hdevice_temp);
+        }
+        return NULL;
+    }
+    secs->base = 0;
+
+    struct sgx_enclave_create param = { 0 };
+    param.src = POINTER_TO_U64(secs);
+    int ret = ioctl(hdevice_temp, SGX_IOC_ENCLAVE_CREATE, &param);
+    if (ret) {
+        SE_TRACE(SE_TRACE_WARNING, "\nSGX_IOC_ENCLAVE_CREATE failed: ret = %d\n", ret);
+        if (enclave_error != NULL)
+            *enclave_error = error_driver2api(ret, errno);
+
+        //if in-kernel driver then close the file handle
+        if (s_driver_type == SGX_DRIVER_IN_KERNEL)
+        {
+            close_file(&hdevice_temp);
+        }
+        munmap(enclave_base, virtual_size);
+
+        return NULL;
+    }
+
+    //in-kernel and DCAP drivers support special provision key access mode (DCAP also supports whitelisting for provision key access)
+    if (((s_driver_type == SGX_DRIVER_IN_KERNEL) || (s_driver_type == SGX_DRIVER_DCAP)) && (secs->attributes.flags & SGX_FLAGS_PROVISION_KEY))
+    {
+        int hdev_prov = -1;
+        if (s_driver_type == SGX_DRIVER_IN_KERNEL)
+        {
+            hdev_prov = open("/dev/sgx/provision", O_RDWR);
+            if (-1 == hdev_prov)
+            {
+                //in-kernel driver can still succeed if the MRSIGNER is whitelisted for provision key
+                SE_TRACE(SE_TRACE_WARNING, "\nOpen in-kernel driver node, failed: errno = %d\n", errno);
+            }
+            else
+            {
+                struct sgx_enclave_set_attribute_in_kernel attrp = { 0 };
+                attrp.attribute_fd = hdev_prov;
+                int ret2 = ioctl(hdevice_temp, SGX_IOC_ENCLAVE_SET_ATTRIBUTE_IN_KERNEL, &attrp);
+                if ( ret2 )
+                {
+                    SE_TRACE(SE_TRACE_WARNING, "\nSGX_IOC_ENCLAVE_SET_ATTRIBUTE, failed: errno = %d\n", errno);
+                }
+            }
+            close(hdev_prov);
+        }
+        else
+        {
+            hdev_prov = open("/dev/sgx_prv", O_RDWR);
+            if (-1 == hdev_prov)
+            {
+                //DCAP driver can still succeed if the MRSIGNER is whitelisted for provision key
+                SE_TRACE(SE_TRACE_WARNING, "\nOpen DCAP driver node, failed: errno = %d\n", errno);
+            }
+            else
+            {
+                struct sgx_enclave_set_attribute attrp = { 0, 0 };
+                attrp.addr = POINTER_TO_U64(enclave_base);
+                attrp.attribute_fd = hdev_prov;
+                int ret2 = ioctl(hdevice_temp, SGX_IOC_ENCLAVE_SET_ATTRIBUTE, &attrp);
+                if ( ret2 )
+                {
+                    SE_TRACE(SE_TRACE_WARNING, "\nSGX_IOC_ENCLAVE_SET_ATTRIBUTE, failed: errno = %d\n", errno);
+                    //It may fail here if DCAP driver doesn't support this ioctl
+                    //Therefore we will continue here instead of returning error code
+                    //The initialization could fail if the driver requires the provision file access
+                }
+                close(hdev_prov);
+            }
+        }        
+       
+    }
+
+    se_mutex_lock(&s_enclave_mutex);
+
+    //if in-kernel driver then save the file handle
+    if (s_driver_type == SGX_DRIVER_IN_KERNEL)
+    {
+        s_hfile[enclave_base] = hdevice_temp;
+    }
+    s_enclave_size[enclave_base] = virtual_size;
+    s_enclave_0_base[enclave_base] = true;
+
+    sgx_attributes_t secs_attr;
+    memset(&secs_attr, 0, sizeof(sgx_attributes_t));
+    memcpy_s(&secs_attr, sizeof(sgx_attributes_t), &secs->attributes, sizeof(sgx_attributes_t));
+    s_secs_attr[enclave_base] = secs_attr;
+
+    s_enclave_mem_region[enclave_base].addr = 0;
+    s_enclave_mem_region[enclave_base].len = 0;
+    s_enclave_mem_region[enclave_base].prot = 0;
+
+    se_mutex_unlock(&s_enclave_mutex);
+
+    if (enclave_error != NULL)
+        *enclave_error = ENCLAVE_ERROR_SUCCESS;
+
+    SE_TRACE(SE_TRACE_DEBUG, "\nSGX_IOC_ENCLAVE_CREATE done: enclave_base = %d, enclave_size = %d\n", enclave_base, enclave_size);
     return enclave_base;
 }
 
@@ -638,7 +845,14 @@ extern "C" size_t COMM_API enclave_load_data(
             addp.src = POINTER_TO_U64(source);
         }
             
-        addp.offset = POINTER_TO_U64((uint64_t)target_address - (uint64_t)enclave_base_addr);
+        //addp.offset = POINTER_TO_U64((uint64_t)target_address - (uint64_t)enclave_base_addr);
+        //TODO: in-kernel-driver flow needs code changes for 0-base enclave's offset value
+        if (s_enclave_0_base[enclave_base_addr]){
+            addp.offset = POINTER_TO_U64((uint64_t)target_address - (uint64_t)0);
+        }
+        else{
+            addp.offset = POINTER_TO_U64((uint64_t)target_address - (uint64_t)enclave_base_addr);
+        }
         addp.length = target_size;
         addp.secinfo = POINTER_TO_U64(&sec_info);
         if (!(data_properties & ENCLAVE_PAGE_UNVALIDATED))
@@ -668,6 +882,7 @@ extern "C" size_t COMM_API enclave_load_data(
         uint8_t page_data[SE_PAGE_SIZE]  __attribute__ ((aligned(4096)));
             
         uint8_t* source = (uint8_t*)source_buffer;
+        SE_TRACE(SE_TRACE_DEBUG, "\nenclave_load_data: DCAP: target_addr = %p\n", target_address);
         if (source == NULL) {
             source = page_data;
             memset(source, 0, SE_PAGE_SIZE);
@@ -687,7 +902,7 @@ extern "C" size_t COMM_API enclave_load_data(
             addp.secinfo = POINTER_TO_U64(&sec_info);
             if (!(data_properties & ENCLAVE_PAGE_UNVALIDATED))
                 addp.mrmask |= 0xFFFF;
-
+            SE_TRACE(SE_TRACE_DEBUG, "\n Ready to Add Page - target= %p\n", addp.addr);
             int ret = ioctl(s_hdevice, SGX_IOC_ENCLAVE_ADD_PAGE, &addp);
             if (ret) {
                 SE_TRACE(SE_TRACE_WARNING, "\nAdd Page - %p to %p... FAIL\n", source, target_address);
@@ -695,6 +910,10 @@ extern "C" size_t COMM_API enclave_load_data(
                 if (enclave_error != NULL)
                     *enclave_error = error_driver2api(ret, errno);
                 return SE_PAGE_SIZE * i;
+            }
+            else
+            {
+                SE_TRACE(SE_TRACE_DEBUG, "\nAdd Page - %p to %p... PASSED\n", source, target_address);
             }
         }
     }
@@ -731,6 +950,7 @@ extern "C" size_t COMM_API enclave_load_data(
             else
                 ret = mprotect(enclave_mem_region->addr, enclave_mem_region->len, enclave_mem_region->prot);
             if (0 != ret) {
+                 SE_TRACE(SE_TRACE_DEBUG, "\nenclave_load_data: mprotect failed\n");
                 if (enclave_error != NULL)
                     *enclave_error = error_driver2api(-1, errno);
                 return 0;
@@ -895,6 +1115,8 @@ extern "C" bool COMM_API enclave_initialize(
 
     if (enclave_error != NULL)
         *enclave_error = ENCLAVE_ERROR_SUCCESS;
+
+    SE_TRACE(SE_TRACE_DEBUG, "\nSGX_IOC_ENCLAVE_INIT passed\n");
     return true;
 }
 
@@ -927,6 +1149,7 @@ extern "C" bool COMM_API enclave_delete(
 
     s_enclave_size.erase(base_address);
     s_enclave_init.erase(base_address);
+    s_enclave_0_base.erase(base_address);
     s_enclave_mem_region.erase(base_address);
     if (s_driver_type == SGX_DRIVER_IN_KERNEL)
     {
